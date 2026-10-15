@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  labels: {{- include "urumi.labels" (list . "gateway") | nindent 4 }}
+spec:
+  selector: {{- include "urumi.selector" "gateway" | nindent 4 }}
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  labels: {{- include "urumi.labels" (list . "gateway") | nindent 4 }}
+spec:
+  {{- if not .Values.gateway.autoscaling.enabled }}
+  replicas: {{ .Values.gateway.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }   # zero-downtime upgrades; failed rollouts keep the old pods serving
+  selector:
+    matchLabels: {{- include "urumi.selector" "gateway" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "urumi.labels" (list . "gateway") | nindent 8 }}
+    spec:
+      {{- if .Values.hosted.enabled }}
+      serviceAccountName: gateway          # needed ONLY to create/delete hosted MCP workloads in this namespace
+      automountServiceAccountToken: true
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      {{- else }}
+      {{- include "urumi.podSecurity" . | nindent 6 }}
+      {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "urumi.selector" "gateway" | nindent 14 }}
+      initContainers:
+        - name: wait-for-postgres
+          image: {{ .Values.images.postgres }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["sh", "-c", "until pg_isready -h postgres -p 5432 -U urumi; do echo waiting for postgres; sleep 2; done"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 70
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: gateway
+          image: {{ .Values.images.gateway }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          ports: [{ name: http, containerPort: 8000 }]
+          env:
+            - { name: COOKIE_SECURE, value: {{ ternary "true" "false" .Values.ingress.tls.enabled | quote }} }
+            - { name: BOOTSTRAP_ADMIN_EMAIL, value: {{ .Values.secrets.adminEmail | quote }} }
+            - { name: SSRF_ALLOW_HOSTS, value: {{ concat (list (printf "woo-mcp.%s.svc.cluster.local" .Release.Namespace) (printf "notes-mcp.%s.svc.cluster.local" .Release.Namespace) (printf "utils-mcp.%s.svc.cluster.local" .Release.Namespace)) (ternary (list (printf "hosted-*.%s.svc.cluster.local" .Release.Namespace)) (list) .Values.hosted.enabled) (ternary (list (printf "woo-mcp.%s*.svc.cluster.local" .Values.stores.namespacePrefix)) (list) .Values.stores.enabled) .Values.gateway.ssrfAllowHosts | join "," | quote }} }
+            - { name: PUBLIC_URL, value: {{ printf "%s://%s" .Values.scheme (include "urumi.appHost" .) | quote }} }
+            - { name: STORES_CONFIG, value: {{ include "urumi.storesConfig" . | quote }} }
+            - { name: TOOLS_MODE, value: {{ .Values.gateway.toolsMode | quote }} }
+            - { name: TOOL_SEARCH_THRESHOLD, value: {{ .Values.gateway.toolSearchThreshold | quote }} }
+            - { name: HOSTED_ENABLED, value: {{ .Values.hosted.enabled | quote }} }
+            - { name: HOSTED_NAMESPACE, value: {{ .Release.Namespace | quote }} }
+            - { name: HOSTED_ALLOWED_PREFIXES, value: {{ join "," .Values.hosted.allowedImagePrefixes | quote }} }
+            - { name: HOSTED_MAX_SERVERS, value: {{ .Values.hosted.maxServers | quote }} }
+            - { name: HOSTED_RUN_AS_USER, value: {{ .Values.hosted.runAsUser | quote }} }
+            - { name: LLM_BASE_URL, value: {{ .Values.gateway.llmBaseUrl | quote }} }
+            - { name: LLM_MODEL, value: {{ .Values.gateway.llmModel | quote }} }
+            - { name: RATE_LIMIT_PER_MINUTE, value: {{ .Values.gateway.rateLimitPerMinute | quote }} }
+            - { name: UPSTREAM_CALL_TIMEOUT, value: {{ .Values.gateway.upstreamCallTimeout | quote }} }
+            - { name: UPSTREAM_LIST_TIMEOUT, value: {{ .Values.gateway.upstreamListTimeout | quote }} }
+            - name: DATABASE_URL
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "database-url") | nindent 16 }}
+            - name: GATEWAY_ENCRYPTION_KEY
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "gateway-encryption-key") | nindent 16 }}
+            - name: GATEWAY_SESSION_SECRET
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "gateway-session-secret") | nindent 16 }}
+            - name: BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "bootstrap-admin-password") | nindent 16 }}
+            - name: SEED_SERVERS
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "seed-servers") | nindent 16 }}
+            - name: LLM_API_KEY
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "llm-api-key") | nindent 16 }}
+          lifecycle:
+            # Zero-downtime rollouts: keep serving while the endpoint is removed from Service/Ingress,
+            # then let the server drain. Without this, a few requests hit a pod that is already shutting down.
+            preStop: { exec: { command: ["sleep", "5"] } }
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 5   # let the CNI program NetworkPolicy for the new pod IP before traffic arrives
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources: {{- toYaml .Values.resources.gateway | nindent 12 }}
+          {{- include "urumi.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: {} }

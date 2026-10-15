@@ -1,0 +1,117 @@
+{{- if .Values.backup.enabled }}
+# Safe store upgrades/rollbacks: before every `helm upgrade` and `helm rollback`, dump the store database to a
+# dedicated PVC. WooCommerce/WordPress run DB migrations on upgrade, so rolling back the *code* alone is not always
+# enough; scripts/restore-store.sh restores one of these dumps.
+#
+# Design notes (Helm subtleties):
+# - The PVC is a normal release resource with resource-policy=keep, so backups survive uninstall and rollbacks to
+#   revisions that predate it. It is NOT a hook: hooks are re-run verbatim on rollback, and re-creating an existing
+#   PVC fails the rollback.
+# - Pre-upgrade hooks run BEFORE release resources are applied, so the dump Job is only rendered once the PVC
+#   exists (lookup). The very first upgrade that introduces the feature therefore has no dump; every later one does.
+# - local-path (and most CSI classes) bind on first consumer and `helm --wait` waits for PVCs to be Bound, so a
+#   tiny per-revision Job mounts the PVC once to bind it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: store-backups
+  labels: {{- include "urumi.labels" (list . "store-backup") | nindent 4 }}
+  annotations: { "helm.sh/resource-policy": keep }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- include "urumi.pvcStorageClass" .Values.storage.className | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.size }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: store-backup-bind-{{ .Release.Revision }}
+  labels: {{- include "urumi.labels" (list . "store-backup") | nindent 4 }}
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: {{- include "urumi.labels" (list . "store-backup") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 999, runAsGroup: 999, fsGroup: 999, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: bind
+          image: {{ .Values.images.mariadb }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["sh", "-c", "ls -lh /backups"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          volumeMounts: [{ name: backups, mountPath: /backups }]
+      volumes:
+        - name: backups
+          persistentVolumeClaim: { claimName: store-backups }
+{{- if lookup "v1" "PersistentVolumeClaim" .Release.Namespace "store-backups" }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: store-backup
+  labels: {{- include "urumi.labels" (list . "store-backup") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-rollback
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels: {{- include "urumi.labels" (list . "store-backup") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: dump
+          image: {{ .Values.images.mariadb }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ok=""; for i in $(seq 1 30); do mariadb-admin ping -h mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --silent && ok=1 && break; sleep 2; done
+              [ -n "$ok" ] || { echo "MariaDB not reachable; refusing to continue the upgrade without a backup"; exit 1; }
+              f="/backups/store-$(date -u +%Y%m%dT%H%M%SZ)-before-rev{{ .Release.Revision }}.sql.gz"
+              # dump to a file first (no pipe), so a failed dump fails the hook instead of leaving an empty archive
+              mariadb-dump -h mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --single-transaction --routines --databases wordpress > /backups/.dump.sql
+              grep -q "CREATE TABLE" /backups/.dump.sql || { echo "dump looks empty"; exit 1; }
+              gzip -c /backups/.dump.sql > "$f.tmp" && rm -f /backups/.dump.sql && mv "$f.tmp" "$f"
+              ls -1t /backups/store-*.sql.gz | tail -n +{{ add1 (int .Values.backup.keep) }} | xargs -r rm -f
+              echo "backup written: $f"; ls -lh /backups
+          env:
+            - name: MARIADB_ROOT_PASSWORD
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "mariadb-root-password") | nindent 16 }}
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: backups, mountPath: /backups }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: backups
+          persistentVolumeClaim: { claimName: store-backups }
+        - name: tmp
+          emptyDir: {}
+{{- end }}
+{{- end }}

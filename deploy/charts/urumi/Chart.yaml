@@ -1,0 +1,6 @@
+apiVersion: v2
+name: urumi
+description: WooCommerce store + WooCommerce MCP server + team MCP gateway, dashboard and chat agent
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

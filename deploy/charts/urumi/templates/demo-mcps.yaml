@@ -1,0 +1,77 @@
+{{- range $kind := list "notes" "utils" }}
+{{- $name := printf "%s-mcp" $kind }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels: {{- include "urumi.labels" (list $ $name) | nindent 4 }}
+spec:
+  selector: {{- include "urumi.selector" $name | nindent 4 }}
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels: {{- include "urumi.labels" (list $ $name) | nindent 4 }}
+spec:
+  replicas: 1
+  {{- if eq $kind "notes" }}
+  strategy: { type: Recreate }
+  {{- end }}
+  selector:
+    matchLabels: {{- include "urumi.selector" $name | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "urumi.labels" (list $ $name) | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+        {{- if eq $kind "notes" }}
+        fsGroup: 10001
+        {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ $.Values.images.demoMcp }}
+          imagePullPolicy: {{ $.Values.images.pullPolicy }}
+          ports: [{ name: http, containerPort: 8000 }]
+          env:
+            - { name: SERVER, value: {{ $kind }} }
+            - name: MCP_AUTH_TOKEN
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" $ "key" (printf "%s-token" $name)) | nindent 16 }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources: {{- toYaml $.Values.resources.demoMcp | nindent 12 }}
+          {{- include "urumi.containerSecurity" $ | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            {{- if eq $kind "notes" }}
+            - { name: data, mountPath: /data }
+            {{- end }}
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        {{- if eq $kind "notes" }}
+        - name: data
+          persistentVolumeClaim: { claimName: notes-data }
+        {{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: notes-data
+  labels: {{- include "urumi.labels" (list . "notes-mcp") | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- include "urumi.pvcStorageClass" .Values.storage.className | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.notes }}

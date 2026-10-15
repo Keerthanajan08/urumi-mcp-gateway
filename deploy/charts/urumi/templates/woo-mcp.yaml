@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: woo-mcp
+  labels: {{- include "urumi.labels" (list . "woo-mcp") | nindent 4 }}
+spec:
+  type: ClusterIP            # never exposed by an Ingress; NetworkPolicy admits only the gateway
+  selector: {{- include "urumi.selector" "woo-mcp" | nindent 4 }}
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: woo-mcp
+  labels: {{- include "urumi.labels" (list . "woo-mcp") | nindent 4 }}
+spec:
+  replicas: {{ .Values.wooMcp.replicas }}
+  selector:
+    matchLabels: {{- include "urumi.selector" "woo-mcp" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "urumi.labels" (list . "woo-mcp") | nindent 8 }}
+    spec:
+      {{- include "urumi.podSecurity" . | nindent 6 }}
+      containers:
+        - name: woo-mcp
+          image: {{ .Values.images.wooMcp }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          ports: [{ name: http, containerPort: 8000 }]
+          env:
+            - { name: WC_BASE_URL, value: "http://wordpress.{{ .Release.Namespace }}.svc.cluster.local" }
+            - { name: STORE_TIMEZONE, value: {{ .Values.store.timezone | quote }} }
+            - { name: WC_AUTH_MODE, value: basic }
+            - name: WC_CONSUMER_KEY
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "wc-consumer-key") | nindent 16 }}
+            - name: WC_CONSUMER_SECRET
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "wc-consumer-secret") | nindent 16 }}
+            - name: MCP_AUTH_TOKEN
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "woo-mcp-token") | nindent 16 }}
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources: {{- toYaml .Values.resources.wooMcp | nindent 12 }}
+          {{- include "urumi.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: {} }

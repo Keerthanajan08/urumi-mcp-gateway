@@ -1,0 +1,180 @@
+{{- if .Values.networkPolicy.enabled }}
+# 1) Everything is closed by default (ingress). Rules below open exactly what the design needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# 2) Only the ingress controller may reach the three public workloads.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-controller
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/component, operator: In, values: [wordpress, dashboard, gateway] }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressControllerNamespace | quote }} }
+        - podSelector: { matchLabels: { app.kubernetes.io/component: smoke } }   # `helm test` pod
+{{- if .Values.ingress.tls.enabled }}
+---
+# 2b) Let's Encrypt HTTP-01: cert-manager briefly runs a solver pod (port 8089) that the ingress controller must reach
+#     while a certificate is issued. Without this, default-deny silently blocks every certificate.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-acme-http01-solver
+spec:
+  podSelector:
+    matchLabels: { acme.cert-manager.io/http01-solver: "true" }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressControllerNamespace | quote }} }
+      ports: [{ protocol: TCP, port: 8089 }]
+{{- end }}
+---
+# 3) MCP servers accept traffic from the gateway only. They have no Ingress and no other caller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-servers-from-gateway-only
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/component, operator: In, values: [woo-mcp, notes-mcp, utils-mcp] }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/component: gateway } }
+      ports: [{ protocol: TCP, port: 8000 }]
+---
+# 4) Database access is limited to its single client.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mariadb-from-wordpress-only
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/component: mariadb } }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/component: wordpress } }
+        - podSelector: { matchLabels: { app.kubernetes.io/component: store-backup } }   # pre-upgrade dump / restore
+      ports: [{ protocol: TCP, port: 3306 }]
+  egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-from-gateway-only
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/component: postgres } }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/component: gateway } }
+        {{- if .Values.stores.enabled }}
+        - podSelector: { matchLabels: { app.kubernetes.io/component: store-provisioner } }
+        {{- end }}
+      ports: [{ protocol: TCP, port: 5432 }]
+  egress: []
+---
+# 5) WordPress is also reachable by the WooCommerce MCP pod (REST API), and nothing else in-cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wordpress-from-woo-mcp
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/component: wordpress } }
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ podSelector: { matchLabels: { app.kubernetes.io/component: woo-mcp } } }]
+      ports: [{ protocol: TCP, port: 80 }]
+---
+# Egress: gateway may talk to its database, the in-cluster MCP servers and the public internet only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/component: gateway } }
+  policyTypes: [Egress]
+  egress:
+    {{- include "urumi.dnsEgress" . | nindent 4 }}
+    - to: [{ podSelector: { matchLabels: { app.kubernetes.io/component: postgres } } }]
+      ports: [{ protocol: TCP, port: 5432 }]
+    - to:
+        - podSelector:
+            matchExpressions:
+              - { key: app.kubernetes.io/component, operator: In, values: [woo-mcp, notes-mcp, utils-mcp] }
+      ports: [{ protocol: TCP, port: 8000 }]
+    {{- if .Values.stores.enabled }}
+    # MCP servers of provisioned stores (each in its own namespace; their own policy admits only the gateway)
+    - to:
+        - namespaceSelector: { matchExpressions: [{ key: urumi.io/store, operator: Exists }] }
+          podSelector: { matchLabels: { app.kubernetes.io/component: woo-mcp } }
+      ports: [{ protocol: TCP, port: 8000 }]
+    {{- end }}
+    {{- if .Values.hosted.enabled }}
+    # hosted MCP servers listen on admin-chosen ports >= 1024; each has its own ingress policy that admits only the gateway
+    - to: [{ podSelector: { matchLabels: { app.kubernetes.io/component: hosted-mcp } } }]
+      ports: [{ protocol: TCP, port: 1024, endPort: 65535 }]
+    {{- if .Values.hosted.apiServerCIDR }}
+    - to: [{ ipBlock: { cidr: {{ .Values.hosted.apiServerCIDR | quote }} } }]    # Kubernetes API, to create/delete hosted workloads
+      ports: [{ protocol: TCP, port: {{ .Values.hosted.apiServerPort }} }]
+    {{- end }}
+    {{- end }}
+    {{- include "urumi.internetEgress" . | nindent 4 }}
+---
+# Egress: the WooCommerce MCP pod can reach WordPress only (not the database, not other pods, not the internet).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: woo-mcp-egress
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/component: woo-mcp } }
+  policyTypes: [Egress]
+  egress:
+    {{- include "urumi.dnsEgress" . | nindent 4 }}
+    - to: [{ podSelector: { matchLabels: { app.kubernetes.io/component: wordpress } } }]
+      ports: [{ protocol: TCP, port: 80 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wordpress-egress
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/component: wordpress } }
+  policyTypes: [Egress]
+  egress:
+    {{- include "urumi.dnsEgress" . | nindent 4 }}
+    - to: [{ podSelector: { matchLabels: { app.kubernetes.io/component: mariadb } } }]
+      ports: [{ protocol: TCP, port: 3306 }]
+    {{- include "urumi.internetEgress" . | nindent 4 }}   # plugin/core downloads from wordpress.org
+    # WordPress calls its own public URL (wp-cron, WooCommerce Action Scheduler, Site Health loopback);
+    # in-cluster DNS sends that to the ingress controller (80/443 for nginx, 8000/8443 are Traefik's pod ports)
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressControllerNamespace | quote }} }
+      ports: [{ protocol: TCP, port: 80 }, { protocol: TCP, port: 443 }, { protocol: TCP, port: 8000 }, { protocol: TCP, port: 8443 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: leaf-services-no-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/component, operator: In, values: [notes-mcp, utils-mcp, dashboard] }
+  policyTypes: [Egress]
+  egress: []
+{{- end }}

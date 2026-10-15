@@ -1,0 +1,18 @@
+# Applied after cert-manager is installed. Replace the email.
+# Its name must match ingress.tls.clusterIssuer in values-prod.yaml. Let's Encrypt needs the VPS to be reachable on
+# port 80 from the internet (HTTP-01 challenge) and DNS A records for store.<domain> and app.<domain>.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik
+            serviceType: ClusterIP   # store namespaces forbid NodePort Services (ResourceQuota); Traefik reaches ClusterIP fine

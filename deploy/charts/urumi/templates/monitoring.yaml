@@ -1,0 +1,34 @@
+{{- if and .Values.metrics.serviceMonitor.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gateway
+  labels: {{- include "urumi.labels" (list . "gateway") | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{- include "urumi.selector" "gateway" | nindent 6 }}
+  endpoints:
+    - { port: http, path: /metrics, interval: {{ .Values.metrics.serviceMonitor.interval }} }
+{{- end }}
+{{- if and .Values.metrics.alerts.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: gateway
+  labels: {{- include "urumi.labels" (list . "gateway") | nindent 4 }}
+spec:
+  groups:
+    - name: urumi-gateway
+      rules:
+        - alert: UpstreamMcpDown
+          expr: gateway_upstream_up == 0
+          for: 2m
+          labels: { severity: warning }
+          annotations: { summary: "MCP upstream {{ "{{" }} $labels.server {{ "}}" }} is unreachable" }
+        - alert: ToolCallErrorRateHigh
+          expr: sum by (server) (rate(gateway_tool_calls_total{outcome!="success"}[5m])) / sum by (server) (rate(gateway_tool_calls_total[5m])) > 0.2
+          for: 5m
+          labels: { severity: warning }
+          annotations: { summary: "More than 20% of tool calls to {{ "{{" }} $labels.server {{ "}}" }} fail" }
+{{- end }}

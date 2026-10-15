@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels: {{- include "urumi.labels" (list . "postgres") | nindent 4 }}
+spec:
+  clusterIP: None
+  selector: {{- include "urumi.selector" "postgres" | nindent 4 }}
+  ports:
+    - { name: pg, port: 5432, targetPort: 5432 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels: {{- include "urumi.labels" (list . "postgres") | nindent 4 }}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: {{- include "urumi.selector" "postgres" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "urumi.labels" (list . "postgres") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70            # postgres user in the alpine image
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: postgres
+          image: {{ .Values.images.postgres }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          ports: [{ name: pg, containerPort: 5432 }]
+          env:
+            - { name: POSTGRES_USER, value: urumi }
+            - { name: POSTGRES_DB, value: gateway }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+            - name: POSTGRES_PASSWORD
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "postgres-password") | nindent 16 }}
+          startupProbe:
+            exec: { command: ["pg_isready", "-U", "urumi", "-d", "gateway"] }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "urumi", "-d", "gateway"] }
+            periodSeconds: 10
+          livenessProbe:
+            exec: { command: ["pg_isready", "-U", "urumi", "-d", "gateway"] }
+            periodSeconds: 20
+            failureThreshold: 6
+          resources: {{- toYaml .Values.resources.postgres | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: run, mountPath: /var/run/postgresql }
+      volumes:
+        - { name: run, emptyDir: {} }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "urumi.pvcStorageClass" .Values.storage.className | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.postgres }}

@@ -1,0 +1,37 @@
+{{- if .Values.hosted.enabled }}
+{{- if not .Values.hosted.apiServerCIDR }}{{ fail "hosted.enabled=true requires hosted.apiServerCIDR (see values.yaml)" }}{{- end }}
+{{- if not .Values.hosted.allowedImagePrefixes }}{{ fail "hosted.enabled=true requires hosted.allowedImagePrefixes" }}{{- end }}
+# The ONLY identity in the release that can talk to the Kubernetes API, and only in this namespace.
+# Kubernetes RBAC cannot filter by label, so the Role covers the four kinds hosted workloads need;
+# A compromised gateway could therefore read Secrets in this namespace: see docs/THREAT_MODEL.md ("hosted servers").
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway
+  labels: {{- include "urumi.labels" (list . "gateway") | nindent 4 }}
+automountServiceAccountToken: false      # pods opt in explicitly (only the gateway pod does)
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gateway-hosted
+  labels: {{- include "urumi.labels" (list . "gateway") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "services"]
+    verbs: ["get", "create", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "create", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gateway-hosted
+  labels: {{- include "urumi.labels" (list . "gateway") | nindent 4 }}
+subjects: [{ kind: ServiceAccount, name: gateway, namespace: {{ .Release.Namespace }} }]
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: gateway-hosted }
+{{- end }}

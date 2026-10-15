@@ -1,0 +1,34 @@
+# Production-like VPS: single-node k3s + cert-manager. Edit `domain`, then:
+#   helm upgrade --install urumi deploy/charts/urumi -n urumi --create-namespace \
+#     -f deploy/charts/urumi/values-prod.yaml
+domain: example.com           # <-- your domain; create A records for store.<domain> and app.<domain>
+scheme: https
+ingress:
+  className: traefik
+  tls:
+    enabled: true
+    clusterIssuer: letsencrypt-prod
+storage:
+  className: local-path       # or longhorn / your block storage class
+  mariadb: 10Gi
+  wordpress: 20Gi
+  postgres: 5Gi
+secrets:
+  create: false               # secrets are created out-of-band (kubectl / SOPS / sealed-secrets)
+  name: urumi-secrets
+  adminEmail: admin@example.com   # <-- the first dashboard admin (password comes from create-secrets.sh)
+images:
+  pullPolicy: IfNotPresent
+  wooMcp: ghcr.io/YOUR_GH_USER/urumi-woo-mcp:1.0.0
+  demoMcp: ghcr.io/YOUR_GH_USER/urumi-demo-mcp:1.0.0
+  gateway: ghcr.io/YOUR_GH_USER/urumi-gateway:1.0.0
+  dashboard: ghcr.io/YOUR_GH_USER/urumi-dashboard:1.0.0
+gateway:
+  replicas: 2                 # stateless sessions + Postgres-backed rate limit => safe to scale
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6, targetCPUUtilizationPercentage: 70 }
+networkPolicy:
+  enabled: true
+  ingressControllerNamespace: kube-system
+resources:
+  wordpress: { requests: { cpu: 300m, memory: 512Mi }, limits: { cpu: "2", memory: 1536Mi } }
+  mariadb:   { requests: { cpu: 200m, memory: 512Mi }, limits: { cpu: "1", memory: 1Gi } }

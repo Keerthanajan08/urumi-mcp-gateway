@@ -1,0 +1,28 @@
+{{- $hpa := .Values.gateway.autoscaling }}
+{{- if $hpa.enabled }}
+# Gateway HPA. Sessions are stateless and the rate limit lives in Postgres, so any replica count is safe.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  labels: {{- include "urumi.labels" (list . "gateway") | nindent 4 }}
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: gateway }
+  minReplicas: {{ $hpa.minReplicas }}
+  maxReplicas: {{ $hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: {{ $hpa.targetCPUUtilizationPercentage }} } }
+{{- end }}
+{{- if and .Values.gateway.pdb.enabled (or $hpa.enabled (gt (int .Values.gateway.replicas) 1)) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  labels: {{- include "urumi.labels" (list . "gateway") | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {{- include "urumi.selector" "gateway" | nindent 6 }}
+{{- end }}

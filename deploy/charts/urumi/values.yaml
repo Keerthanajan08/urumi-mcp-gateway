@@ -1,0 +1,132 @@
+# ---------------------------------------------------------------------------
+# Defaults. Environment differences live ONLY in values-local.yaml / values-prod.yaml.
+# ---------------------------------------------------------------------------
+domain: urumi.localtest.me        # *.localtest.me resolves to 127.0.0.1 via public DNS (no /etc/hosts edits)
+hosts:
+  store: ""                       # default: store.<domain>
+  app: ""                         # default: app.<domain>  (dashboard + /api + /mcp)
+scheme: http                      # public URL scheme; "https" once TLS is on
+
+ingress:
+  className: traefik              # k3s/k3d ship Traefik. Use "nginx" for ingress-nginx.
+  annotations: {}
+  tls:
+    enabled: false
+    clusterIssuer: ""             # cert-manager ClusterIssuer name, e.g. letsencrypt-prod
+    storeSecretName: urumi-store-tls
+    appSecretName: urumi-app-tls
+
+storage:
+  className: ""                   # "" = cluster default (k3s: local-path)
+  mariadb: 2Gi
+  wordpress: 5Gi
+  postgres: 1Gi
+  notes: 256Mi
+
+secrets:
+  create: true                    # false => you provide a Secret named `name` (see README for keys)
+  name: urumi-secrets
+  adminEmail: admin@example.com   # first dashboard admin
+  adminPassword: ""               # blank => random (read it back, see NOTES)
+  llmApiKey: ""                   # chat agent LLM key; pass with --set secrets.llmApiKey=...
+
+images:
+  pullPolicy: IfNotPresent
+  wordpress: wordpress:6.7-apache
+  wpcli: wordpress:cli-2.11.0-php8.3
+  mariadb: mariadb:11.4
+  postgres: postgres:16-alpine
+  wooMcp: urumi/woo-mcp:1.0.0
+  demoMcp: urumi/demo-mcp:1.0.0
+  gateway: urumi/gateway:1.0.0
+  dashboard: urumi/dashboard:1.0.0
+
+store:
+  title: Urumi Demo Store
+  adminUser: shopadmin
+  adminEmail: shop@example.com
+  currency: USD
+  country: US
+  timezone: Asia/Kolkata          # used by the MCP "orders today" filter
+  # Pinned so installs are reproducible. Must support the WordPress version in images.wordpress
+  # (the newest WooCommerce often requires a newer WordPress than the image ships).
+  woocommerceVersion: "10.3.0"
+
+wooMcp: { replicas: 1 }
+
+gateway:
+  replicas: 1                     # stateless MCP sessions: any replica serves any request
+  toolsMode: auto                 # full | search | auto: above toolSearchThreshold visible tools, /mcp and chat expose search/describe/call
+  toolSearchThreshold: 40
+  autoscaling: { enabled: false, minReplicas: 2, maxReplicas: 6, targetCPUUtilizationPercentage: 70 }
+  pdb: { enabled: true }          # PodDisruptionBudget (minAvailable 1) whenever more than one replica can run
+  llmBaseUrl: https://api.groq.com/openai/v1   # any OpenAI-compatible endpoint
+  llmModel: openai/gpt-oss-120b       # Groq retired llama-3.3-70b-versatile; list current models with GET /openai/v1/models
+  rateLimitPerMinute: 120
+  ssrfAllowHosts: []              # extra in-cluster hosts admins may register (fnmatch patterns)
+  upstreamCallTimeout: 30
+  upstreamListTimeout: 8
+
+networkPolicy:
+  enabled: true                   # needs a CNI that enforces them (k3s/k3d do; plain kind does not)
+  ingressControllerNamespace: kube-system   # where Traefik runs on k3s; "ingress-nginx" for nginx
+
+resources:
+  mariadb:   { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1",    memory: 768Mi } }
+  wordpress: { requests: { cpu: 200m, memory: 384Mi }, limits: { cpu: 1500m,  memory: 1Gi } }
+  wpSetup:   { requests: { cpu: 50m,  memory: 128Mi }, limits: { cpu: 500m,   memory: 512Mi } }
+  wooMcp:    { requests: { cpu: 50m,  memory: 96Mi },  limits: { cpu: 500m,   memory: 256Mi } }
+  demoMcp:   { requests: { cpu: 25m,  memory: 64Mi },  limits: { cpu: 250m,   memory: 192Mi } }
+  postgres:  { requests: { cpu: 100m, memory: 192Mi }, limits: { cpu: 500m,   memory: 512Mi } }
+  gateway:   { requests: { cpu: 100m, memory: 192Mi }, limits: { cpu: "1",    memory: 512Mi } }
+  dashboard: { requests: { cpu: 25m,  memory: 32Mi },  limits: { cpu: 200m,   memory: 96Mi } }
+
+# --- Safe upgrades: dump the store DB to the `store-backups` PVC before every helm upgrade/rollback (see scripts/restore-store.sh)
+backup:
+  enabled: true
+  keep: 5                         # newest N dumps are kept
+  size: 2Gi
+
+# --- Hosted MCP servers (stand-out). OFF by default: turning it on mounts a ServiceAccount token into the gateway pod
+# and grants a namespaced Role (see templates/rbac.yaml). Images must start with one of allowedImagePrefixes.
+hosted:
+  enabled: false
+  allowedImagePrefixes: []        # e.g. ["ghcr.io/your-org/", "urumi/"]
+  maxServers: 5
+  runAsUser: 10001
+  apiServerCIDR: ""               # REQUIRED when enabled: gateway egress to the K8s API, e.g. "10.0.0.5/32" (kubectl get endpoints kubernetes)
+  apiServerPort: 6443
+
+# --- Multi-store provisioning (bonus). OFF by default. When on, users create/delete stores from the dashboard; a
+# separate store-provisioner Deployment (its own ServiceAccount + ClusterRole, confined to `<namespacePrefix>*`
+# namespaces by a ValidatingAdmissionPolicy) creates one namespace per store and registers its MCP server.
+stores:
+  enabled: false
+  maxPerUser: 2
+  provisionTimeoutSeconds: 900      # a store that is not Ready by then is marked Failed with the reason
+  namespacePrefix: store-
+  domain: ""                        # storefront host = <slug>.<domain>; default: .Values.domain
+  apiServerCIDR: ""                 # REQUIRED when enabled: provisioner egress to the K8s API (kubectl get endpoints kubernetes)
+  apiServerPort: 6443
+  admissionPolicy: true             # needs Kubernetes >= 1.30 (ValidatingAdmissionPolicy GA)
+  quota:                            # ResourceQuota per store namespace
+    requestsCpu: "1"
+    requestsMemory: 1536Mi
+    limitsCpu: "4"
+    limitsMemory: 3Gi
+    pods: 6
+    pvcs: 3
+    storage: 10Gi
+  storage: { mariadb: 2Gi, wordpress: 3Gi }
+  resources:                        # per-store workloads (smaller than the main store)
+    mariadb:   { requests: { cpu: 50m,  memory: 192Mi }, limits: { cpu: 500m, memory: 512Mi } }
+    wordpress: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1",  memory: 768Mi } }
+    wpSetup:   { requests: { cpu: 25m,  memory: 96Mi },  limits: { cpu: 500m, memory: 384Mi } }
+    wooMcp:    { requests: { cpu: 25m,  memory: 80Mi },  limits: { cpu: 250m, memory: 192Mi } }
+  provisioner:
+    resources: { requests: { cpu: 25m, memory: 96Mi }, limits: { cpu: 250m, memory: 256Mi } }
+
+# --- Observability (stand-out). The gateway always serves /metrics in-cluster; these add Prometheus Operator objects.
+metrics:
+  serviceMonitor: { enabled: false, interval: 30s }
+  alerts: { enabled: false }

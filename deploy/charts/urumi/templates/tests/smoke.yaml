@@ -1,0 +1,25 @@
+# `helm test urumi -n urumi` : in-cluster check that the gateway answers and discovery metadata is served.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-smoke
+  labels: {{- include "urumi.labels" (list . "smoke") | nindent 4 }}
+  annotations: { "helm.sh/hook": test, "helm.sh/hook-delete-policy": "before-hook-creation,hook-succeeded" }
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext: { runAsNonRoot: true, runAsUser: 10001, seccompProfile: { type: RuntimeDefault } }
+  containers:
+    - name: curl
+      image: {{ .Values.images.gateway }}
+      imagePullPolicy: {{ .Values.images.pullPolicy }}
+      command: ["python", "-c"]
+      args:
+        - |
+          import json, urllib.request as u
+          g = "http://gateway:8000"
+          assert json.load(u.urlopen(g + "/readyz"))["status"] == "ready"
+          assert "authorization_endpoint" in json.load(u.urlopen(g + "/.well-known/oauth-authorization-server"))
+          print("gateway smoke test OK")
+      resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { cpu: 100m, memory: 96Mi } }
+      securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }

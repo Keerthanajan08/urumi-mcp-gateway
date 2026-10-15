@@ -1,0 +1,22 @@
+# Local: k3d (k3s in Docker). Ports 80/443 are mapped by `make cluster`.
+domain: urumi.localtest.me
+scheme: http
+ingress:
+  className: traefik
+  tls: { enabled: false }
+storage:
+  className: ""            # k3d default: local-path
+images:
+  # Our four images are loaded with `make import` (k3d image import), so IfNotPresent never pulls them; the
+  # third-party images (WordPress, MariaDB, Postgres) are pulled from Docker Hub on first start.
+  # (Never would also stop those from being pulled.)
+  pullPolicy: IfNotPresent
+  wooMcp: urumi/woo-mcp:local
+  demoMcp: urumi/demo-mcp:local
+  gateway: urumi/gateway:local
+  dashboard: urumi/dashboard:local
+gateway:
+  replicas: 1
+networkPolicy:
+  enabled: true
+  ingressControllerNamespace: kube-system

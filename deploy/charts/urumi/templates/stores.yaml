@@ -1,0 +1,183 @@
+{{- if .Values.stores.enabled }}
+{{- if not .Values.stores.apiServerCIDR }}{{ fail "stores.enabled=true requires stores.apiServerCIDR (kubectl get endpoints kubernetes)" }}{{- end }}
+{{- $ns := .Release.Namespace }}
+{{- $sa := "store-provisioner" }}
+{{- $prefix := .Values.stores.namespacePrefix }}
+# ------------------------------------------------------------------------------------------------------------------
+# Store provisioner (bonus). The ONLY identity with cluster-scoped rights, and it is:
+#   - separate from the internet-facing gateway (which only writes desired state to Postgres),
+#   - denied reads of Secrets anywhere (it only creates/patches them),
+#   - confined by a ValidatingAdmissionPolicy to namespaces named "{{ $prefix }}*" for every write.
+# ------------------------------------------------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: store-files
+  labels: {{- include "urumi.labels" (list . "store-provisioner") | nindent 4 }}
+data:
+  wp-setup.sh: |
+{{ .Files.Get "files/wp-setup.sh" | indent 4 }}
+  create-api-keys.php: |
+{{ .Files.Get "files/create-api-keys.php" | indent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  labels: {{- include "urumi.labels" (list . "store-provisioner") | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $ns }}-store-provisioner
+  labels: {{- include "urumi.labels" (list . "store-provisioner") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps", "services", "persistentvolumeclaims", "resourcequotas", "limitranges"]
+    verbs: ["create", "patch", "delete"]          # deliberately no get/list: it can write Secrets but never read them
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "create", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies", "ingresses"]
+    verbs: ["create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["list"]                                 # only to explain why a store failed
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $ns }}-store-provisioner
+  labels: {{- include "urumi.labels" (list . "store-provisioner") | nindent 4 }}
+subjects: [{ kind: ServiceAccount, name: {{ $sa }}, namespace: {{ $ns }} }]
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $ns }}-store-provisioner }
+{{- if .Values.stores.admissionPolicy }}
+---
+# RBAC cannot express "only namespaces called store-*"; an admission policy can. Every create/update/delete the
+# provisioner sends is rejected unless it targets a store namespace (or is such a namespace itself).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $ns }}-store-provisioner-scope
+  labels: {{- include "urumi.labels" (list . "store-provisioner") | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["*"]
+  matchConditions:
+    - name: is-store-provisioner
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ $ns }}:{{ $sa }}'"
+  validations:
+    - expression: >-
+        (request.namespace != '' && request.namespace.startsWith('{{ $prefix }}')) ||
+        (request.resource.resource == 'namespaces' && request.name.startsWith('{{ $prefix }}'))
+      message: "the store provisioner may only manage {{ $prefix }}* namespaces"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $ns }}-store-provisioner-scope
+  labels: {{- include "urumi.labels" (list . "store-provisioner") | nindent 4 }}
+spec:
+  policyName: {{ $ns }}-store-provisioner-scope
+  validationActions: [Deny]
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: store-provisioner
+  labels: {{- include "urumi.labels" (list . "store-provisioner") | nindent 4 }}
+spec:
+  selector: {{- include "urumi.selector" "store-provisioner" | nindent 4 }}
+  ports: [{ name: http, port: 8080, targetPort: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: store-provisioner
+  labels: {{- include "urumi.labels" (list . "store-provisioner") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # one leader at a time (a Postgres advisory lock also guarantees it)
+  selector:
+    matchLabels: {{- include "urumi.selector" "store-provisioner" | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "urumi.labels" (list . "store-provisioner") | nindent 8 }}
+      annotations:
+        checksum/store-files: {{ (printf "%s%s" (.Files.Get "files/wp-setup.sh") (.Files.Get "files/create-api-keys.php")) | sha256sum }}
+    spec:
+      serviceAccountName: {{ $sa }}
+      automountServiceAccountToken: true
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        - name: wait-for-postgres
+          image: {{ .Values.images.postgres }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["sh", "-c", "until pg_isready -h postgres -p 5432 -U urumi; do echo waiting for postgres; sleep 2; done"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 70
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: provisioner
+          image: {{ .Values.images.gateway }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["python", "-m", "app.provisioner"]
+          ports: [{ name: http, containerPort: 8080 }]
+          env:
+            - { name: STORES_CONFIG, value: {{ include "urumi.storesConfig" . | quote }} }
+            - name: DATABASE_URL
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "database-url") | nindent 16 }}
+            - name: GATEWAY_ENCRYPTION_KEY
+              valueFrom: {{- include "urumi.secretRef" (dict "ctx" . "key" "gateway-encryption-key") | nindent 16 }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            failureThreshold: 3
+          resources: {{- toYaml .Values.stores.provisioner.resources | nindent 12 }}
+          {{- include "urumi.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - { name: files, mountPath: /etc/urumi/store-files, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: files
+          configMap: { name: store-files }
+        - { name: tmp, emptyDir: {} }
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: store-provisioner-egress
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/component: store-provisioner } }
+  policyTypes: [Egress]
+  egress:
+    {{- include "urumi.dnsEgress" . | nindent 4 }}
+    - to: [{ podSelector: { matchLabels: { app.kubernetes.io/component: postgres } } }]
+      ports: [{ protocol: TCP, port: 5432 }]
+    - to: [{ ipBlock: { cidr: {{ .Values.stores.apiServerCIDR | quote }} } }]
+      ports: [{ protocol: TCP, port: {{ .Values.stores.apiServerPort }} }]
+{{- end }}
+{{- end }}

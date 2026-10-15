@@ -1,0 +1,5 @@
+# Keep LF everywhere: shell scripts and the store bootstrap scripts (mounted into Linux containers) break with CRLF,
+# which Git for Windows would otherwise produce on checkout.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
