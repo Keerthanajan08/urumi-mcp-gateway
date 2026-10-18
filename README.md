@@ -1,5 +1,7 @@
 # Urumi: WooCommerce hosting with a team MCP gateway on Kubernetes
 
+**Demo video:** https://drive.google.com/file/d/1lYyodz_sGm0mDxgblnD7DoU3yYhYmq-v/view?usp=sharing
+
 A WooCommerce store on Kubernetes, an MCP server for it written from scratch, and a **team MCP gateway**. Admins connect MCP servers once. Every team member then uses all of them through **one MCP endpoint** (Claude Code, Cursor, MCP Inspector) and through a **chat agent** in the dashboard, with:
 
 - per-user API keys (or an OAuth browser login)
