@@ -26,7 +26,7 @@ export function CopyBox({ value, label }) {
   return (
     <div className="copybox">
       <code>{value}</code>
-      <button className="ghost" onClick={() => { copy(value); setOk(true); setTimeout(() => setOk(false), 1500); }}>{ok ? "Copied" : label || "Copy"}</button>
+      <button className="ghost" onClick={async () => { setOk((await copy(value)) ? "Copied" : "Select and copy manually"); setTimeout(() => setOk(false), 2000); }}>{ok || label || "Copy"}</button>
     </div>
   );
 }

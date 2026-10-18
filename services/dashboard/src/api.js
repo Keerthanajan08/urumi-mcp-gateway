@@ -29,4 +29,21 @@ export const fmtAgo = (iso) => {
   if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
   return `${Math.floor(s / 86400)} d ago`;
 };
-export const copy = (text) => navigator.clipboard?.writeText(text);
+// navigator.clipboard only exists on HTTPS or localhost. Over plain HTTP (the local
+// k3d setup, *.localtest.me) fall back to a hidden textarea + execCommand("copy").
+export const copy = async (text) => {
+  if (window.isSecureContext && navigator.clipboard) {
+    try { await navigator.clipboard.writeText(text); return true; } catch { /* fall through */ }
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.top = "-1000px";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch { ok = false; }
+  document.body.removeChild(ta);
+  return ok;
+};
